@@ -124,11 +124,11 @@ module imem (
     logic [31:0] RAM [0:63];
 
     initial begin
-        // Fill unused locations with NOPs.
+        // Fill unused locations with NOPs. The testbench loads the generated
+        // program into RAM after it creates memfile.dat, so this block avoids
+        // a race with the file generation step.
         for (int i = 0; i < 64; i++)
             RAM[i] = 32'b0;
-
-        $readmemh("memfile.dat", RAM);
     end
 
     assign rd = RAM[a];

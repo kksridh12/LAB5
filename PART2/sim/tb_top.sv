@@ -3,7 +3,7 @@
 //
 //  1. Create the instruction generator and generate a random program
 //  2. Load the program (memfile.dat) into instruction memory ($readmemh) and
-//     write the starting data (dmemfile.dat) through dmem's write port
+//     the starting data (dmemfile.dat) into data memory ($readmemh)
 //  3. Deassert reset -> the MIPS processor starts fetching
 //  4. Trickbox: when the processor writes 0xDEADBEEF to address 0xFC,
 //     print a message and call $finish
@@ -19,10 +19,6 @@ module tb_top;
   logic        memwrite;
 
   int cycle = 0;
-
-  // Used to load the starting data memory (see the initial block below)
-  logic [31:0] dmem_init [0:63];
-  logic [31:0] init_addr, init_data;
 
   instruction_generator gen;
 
@@ -41,32 +37,15 @@ module tb_top;
     reset = 1;
 
     gen = new();
-    gen.generate_program();      // writes memfile.dat and dmemfile.dat
+    gen.generate_machine_code(); // writes memfile.dat and dmemfile.dat
     gen.display_all();
 
     #1;                          // wait for imem's own initial block to finish
     $readmemh("memfile.dat",  dut.imem.RAM);
     `uvm_info("TB", "Loaded memfile.dat into imem", UVM_LOW)
 
-    // dmem.RAM is written by an always_ff in top.sv, so the TB is not allowed
-    // to write it directly (VCS error ICPD). Instead, while the processor is
-    // held in reset, we drive dmem's own write port and write every word.
-    $readmemh("dmemfile.dat", dmem_init);
-    init_addr = 0;
-    init_data = dmem_init[0];
-    force dut.dmem.we = 1'b1;
-    force dut.dmem.a  = init_addr;
-    force dut.dmem.wd = init_data;
-    for (int w = 0; w < DMEM_WORDS; w++) begin
-      @(negedge clk);            // change address/data away from the clock edge
-      init_addr = w * 4;
-      init_data = dmem_init[w];
-    end
-    @(negedge clk);              // last word is written on the posedge before this
-    release dut.dmem.we;
-    release dut.dmem.a;
-    release dut.dmem.wd;
-    `uvm_info("TB", "Loaded dmemfile.dat into dmem through its write port", UVM_LOW)
+    $readmemh("dmemfile.dat", dut.dmem.RAM);
+    `uvm_info("TB", "Loaded dmemfile.dat into dmem", UVM_LOW)
 
     @(negedge clk);
     reset = 0;

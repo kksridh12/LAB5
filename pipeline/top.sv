@@ -105,13 +105,14 @@ module dmem (
 
     assign rd = RAM[a[7:2]];
 
-    always_ff @(posedge clk) begin
+    // Plain always (not always_ff) so the testbench can preload RAM with
+    // $readmemh; an always_ff variable may not be written by another process.
+    always @(posedge clk) begin
         if (we)
             RAM[a[7:2]] <= wd;
     end
 
 endmodule
-
 
 // ============================================================
 // Instruction memory: 64 words loaded from memfile.dat

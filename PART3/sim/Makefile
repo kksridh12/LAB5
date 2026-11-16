@@ -1,6 +1,7 @@
 VCS ?= $(VCS_HOME)/bin/vcs
 VERDI ?= $(VERDI_HOME)/bin/verdi
 SEED ?= 1
+SEEDS ?= 1 2 3 4 5 6 7 8 9 10 11 12
 UVM_VERBOSITY ?= UVM_MEDIUM
 
 # Part 3 depends on the Part 2 random instruction generator plus the Part 3
@@ -8,8 +9,7 @@ UVM_VERBOSITY ?= UVM_MEDIUM
 SV_SRCS := \
 	../../PART2/sim/instr_gen.sv \
 	instr_mem_if.sv \
-	mips_uvm_pkg.sv \
-	tb_top.sv \
+	coverage_collector.sv \
 	../../pipeline/top.sv \
 	../../pipeline/controller.sv \
 	../../pipeline/datapath.sv
@@ -39,7 +39,7 @@ compile_verdi:
 
 # Run the compiled simulation
 sim:
-	./simv +UVM_VERBOSITY=$(UVM_VERBOSITY) +ntb_random_seed=$(SEED) -l sim_$(SEED).log
+	./simv +UVM_VERBOSITY=$(UVM_VERBOSITY) +ntb_random_seed=$(SEED) -cm_dir cov_$(SEED).vdb -l sim_$(SEED).log
 
 # Launch Verdi, optionally loading the generated waveform database
 verdi:
@@ -48,12 +48,24 @@ verdi:
 waves:
 	$(VERDI) -dbdir ./simv.daidir -ssf novas.fsdb -nologo
 
+regress: compile_verdi
+	for s in $(SEEDS); do $(MAKE) sim SEED=$$s; done
+
+merge:
+	$(VCS_HOME)/bin/urg -dir cov_*.vdb -dbname merged_coverage.vdb
+
+cov:
+	$(VERDI_HOME)/bin/verdi -cov -covdir merged_coverage.vdb &
+
+cov_one:
+	$(VERDI_HOME)/bin/verdi -cov -covdir cov_$(SEED).vdb &
+
 gui:
 	./simv +UVM_VERBOSITY=$(UVM_VERBOSITY) +ntb_random_seed=$(SEED) -gui=verdi
 
 clean:
 	rm -rf *.log *.h csrc simv simv.daidir *.vdb *.fsdb ucli.key DVEFiles \
-		verdiLog novas.* memfile.dat dmemfile.dat
+		verdiLog novas.* memfile.dat dmemfile.dat urgReport *.conf *Log
 
 
 

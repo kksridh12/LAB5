@@ -30,16 +30,9 @@
 //       addi $i, $0, <init_val>
 //       sw   $i, <0x10/0x14/0x18/0x1C>($0)   -> registers AND memory initialized
 //
-// Trickbox (end of simulation): one instruction
-//       lw $0, 0($0)          <- destination register is $0
-// The testbench ends the test as soon as any valid instruction writes back
-// with $0 as its destination.  The body never targets $0 (dest regs are
-// $1..$4), NOPs/flushed instructions are not valid in the pipeline, so only
-// this instruction can trigger it.  The write to $0 is discarded by the
-// register file, and the load reads dmem word 0 (no side effects).
-//
 // Add -ntb_opts uvm to the VCS command line
 //////////////////////////////////////////////////////////////////////////////
+
 package mips_instr_pkg;
   import uvm_pkg::*;
   `include "uvm_macros.svh"
@@ -362,6 +355,13 @@ package mips_instr_pkg;
       fix_branches();
     endfunction
 
+    // Trickbox (end of simulation): one instruction
+    //       lw $0, 0($0)          <- destination register is $0
+    // The testbench ends the test as soon as any valid instruction writes back
+    // with $0 as its destination.  The body never targets $0 (dest regs are
+    // $1..$4), NOPs/flushed instructions are not valid in the pipeline, so only
+    // this instruction can trigger it.  The write to $0 is discarded by the
+    // register file, and the load reads dmem word 0 (no side effects).
     // lw $0, 0($0): the only instruction in the program with $0 as destination
     function void add_trickbox();
       add_instr(make_lw_sw(I_LW, 0, 16'h0, "trickbox: dest $0 -> END OF TEST"));
@@ -511,21 +511,132 @@ package mips_instr_pkg;
 
 endpackage
 
-
-// ============================================================================
-// testbench : runs only the generator (no DUT).
-// The full testbench with the processor is tb_top.sv, which also loads the
-// memories with $readmemh and deasserts reset.
-// ============================================================================
-module testbench;
+module tb_top();
+  import uvm_pkg::*;
+  `include "uvm_macros.svh"
   import mips_instr_pkg::*;
+
+  logic        clk;
+  logic        reset;
+  logic [31:0] writedata, dataadr;
+  logic        memwrite;
+  bit          done = 0;               // set by the trickbox
 
   instruction_generator gen;
 
+  // DUT
+  top dut (.clk(clk), .reset(reset), .writedata(writedata),
+           .dataadr(dataadr), .memwrite(memwrite));
+
+  // Clock: 10 ns period
+  initial clk = 0;
+  always #5 clk = ~clk;
+
+`ifdef COVERAGE
+  // --------------------------------------------------------------------------
+  // Part 3: instruction fetch interface (watched by the monitor), resource db
+  // and run_test(). run_test() must be called at time 0, so it has its own
+  // initial block.
+  // --------------------------------------------------------------------------
+  instr_mem_if vif (clk);
+  assign vif.reset        = reset;
+  assign vif.pc           = dut.pc;
+  assign vif.instr        = dut.instr;
+  assign vif.branch_taken = dut.mips.dp.E_chgPC;
+  assign vif.branch_pc    = dut.mips.dp.E_pcplus4 - 4;
+  assign vif.done         = done;
+
   initial begin
+    // Scope "*" = visible to every component; read with read_by_name("vif")
+    uvm_resource_db #(virtual instr_mem_if)::set("*", "vif", vif);
+    run_test("my_test");
+  end
+`endif
+
+  // --------------------------------------------------------------------------
+  // Generate the program, load instruction memory, release reset
+  // --------------------------------------------------------------------------
+  initial begin
+    reset = 1;
+
     gen = new();
-    gen.generate_machine_code();
+    gen.generate_machine_code(); // writes memfile.dat
     gen.display_all();
+
+    #1;                          // wait for imem's own initial block to finish
+    $readmemh("memfile.dat", dut.imem.RAM);
+    `uvm_info("TB", "Loaded memfile.dat into imem", UVM_LOW)
+
+    @(negedge clk);
+    reset = 0;
+    `uvm_info("TB", "Reset deasserted, processor is running", UVM_LOW)
+  end
+
+`ifndef COVERAGE
+  // --------------------------------------------------------------------------
+  // Part 2: print every instruction fetch (Part 3's monitor prints executed
+  // instructions instead)
+  // --------------------------------------------------------------------------
+  int cycle = 0;
+  always @(negedge clk) begin
+    if (!reset) begin
+      $display("[%0t] cycle %0d: FETCH pc=%h instr=%h", $time, cycle, dut.pc, dut.instr);
+      cycle++;
+    end
+  end
+`endif
+
+  // --------------------------------------------------------------------------
+  // Trickbox: watch the writeback stage (XMR into the DUT).  Any valid
+  // instruction writing back with destination $0 ends the test.  NOPs and
+  // flushed/bubbled instructions have WB_valid = 0, so they never trigger it.
+  // --------------------------------------------------------------------------
+  always @(negedge clk) begin
+    if (!reset && !done && dut.mips.dp.WB_valid === 1 &&
+        dut.mips.dp.WB_regwrite === 1 && dut.mips.dp.WB_dest === 5'd0) begin
+      $display("\n[TRICKBOX] Instruction with destination $0 reached writeback. Simulation ending.");
+      // Every older instruction has already written back, so check now
+      check_final_state();
+      done = 1;
+`ifndef COVERAGE
+      $finish;                   // Part 3: my_test sees vif.done and ends UVM
+`endif
+    end
+  end
+
+  // Compare the DUT's registers and memory with the generator's model
+  task automatic check_final_state();
+    int errors = 0;
+    for (int r = 1; r <= 4; r++)
+      if (dut.mips.dp.rf.rf[r] !== gen.model_reg[r]) begin
+        `uvm_error("CHECK", $sformatf("$%0d = %h, expected %h",
+                                      r, dut.mips.dp.rf.rf[r], gen.model_reg[r]))
+        errors++;
+      end
+    // Only words the program stores to: the rest of dmem is never initialized (X)
+    for (int w = 0; w < DMEM_WORDS; w++)
+      if (gen.model_mem_written[w] && dut.dmem.RAM[w] !== gen.model_mem[w]) begin
+        `uvm_error("CHECK", $sformatf("mem[%h] = %h, expected %h",
+                                      w * 4, dut.dmem.RAM[w], gen.model_mem[w]))
+        errors++;
+      end
+    if (errors == 0)
+      `uvm_info("CHECK", "PASS: final registers and memory match the expected values", UVM_LOW)
+  endtask
+
+  // --------------------------------------------------------------------------
+  // Timeout in case the trickbox is never reached
+  // --------------------------------------------------------------------------
+  initial begin
+    #20000;
+    `uvm_fatal("TB", "TIMEOUT: trickbox was never reached")
+  end
+
+  // --------------------------------------------------------------------------
+  // Waveform dump for Verdi
+  // --------------------------------------------------------------------------
+  initial begin
+    $fsdbDumpfile("novas.fsdb");
+    $fsdbDumpvars(0, tb_top);
   end
 endmodule
-

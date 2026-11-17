@@ -7,7 +7,6 @@ UVM_VERBOSITY ?= UVM_MEDIUM
 # declares typedefs used by the other RTL modules.
 SV_SRCS := \
 	instr_gen.sv \
-	tb_top.sv \
 	../../pipeline/top.sv \
 	../../pipeline/controller.sv \
 	../../pipeline/datapath.sv

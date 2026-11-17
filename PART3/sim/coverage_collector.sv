@@ -13,6 +13,11 @@
 //   tb_top         : DUT, interface, resource db, generator, memories, reset,
 //                    run_test(), trickbox, final-state check
 //
+// Program = setup (addi $i / sw $i, writes the literals) + random body +
+// trickbox (lw $0, 0($0): the only instruction with $0 as destination).
+// ADDI only appears in the setup; it is decoded and tracked by the monitor
+// (so register dependencies stay correct) but has no coverage bins.
+//
 // The instruction class and the generator come from Part 2 (../instr_gen.sv).
 // Add -ntb_opts uvm to the VCS command line
 //////////////////////////////////////////////////////////////////////////////
@@ -79,6 +84,12 @@ class instr_monitor extends uvm_monitor;
         continue;
       end
 
+      // Trickbox (lw $0) already fetched: later fetches never execute (the
+      // pc may even wrap around to 0), so ignore them. A taken branch above
+      // still removes a trickbox that was fetched on the wrong path.
+      if (pending.size() > 0 && is_trickbox(pending[$]))
+        continue;
+
       // Same pc as last cycle = stall
       if (new_fetch == 0 && vif.pc == last_pc)
         continue;
@@ -110,6 +121,11 @@ class instr_monitor extends uvm_monitor;
       end
     end
     `uvm_warning("MON", $sformatf("Taken branch at pc %h was not found", beq_pc))
+  endfunction
+
+  // End-of-test instruction: lw $0, 0($0) (destination $0)
+  function bit is_trickbox(instruction t);
+    return (t.opcode == I_LW && t.reg_b == 0);
   endfunction
 
   // Send the oldest pending instruction to the analysis port
@@ -151,6 +167,10 @@ class instr_monitor extends uvm_monitor;
       6'b000100: begin
         tr.opcode    = I_BEQ;
         tr.br_offset = mc[2:0];
+      end
+      6'b001000: begin                       // setup only
+        tr.opcode = I_ADDI;
+        tr.imm    = mc[15:0];
       end
       default: `uvm_warning("MON", $sformatf("Unknown instruction %h", mc))
     endcase
@@ -229,10 +249,15 @@ class instr_coverage extends uvm_subscriber #(instruction);
 
   // --------------------------------------------------------------------------
   // Order of two back-to-back executed instructions (5 x 5 = 25 orders)
+  // ADDI (setup only) has no bins, so the cross stays 5 x 5.
   // --------------------------------------------------------------------------
   covergroup instr_order_cg;
-    cp_prev: coverpoint prev.opcode;
-    cp_curr: coverpoint tr.opcode;
+    cp_prev: coverpoint prev.opcode {
+      bins op[] = {I_ADD, I_AND, I_LW, I_SW, I_BEQ};
+    }
+    cp_curr: coverpoint tr.opcode {
+      bins op[] = {I_ADD, I_AND, I_LW, I_SW, I_BEQ};
+    }
     x_order: cross cp_prev, cp_curr;
   endgroup
 
@@ -308,7 +333,9 @@ class instr_coverage extends uvm_subscriber #(instruction);
     prev = tr;
   endfunction
 
-  // Find the most recent instruction that wrote register r
+  // Find the most recent instruction that wrote register r.
+  // ADDI writers are found too (so an older writer is never matched by
+  // mistake), but cp_first has no ADDI bin, so they are not counted.
   function void check_reg_dependency(bit [4:0] r);
     for (int i = history.size() - 1; i >= 0; i--) begin
       if (history[i].dest_reg() == r) begin
@@ -448,13 +475,12 @@ module tb_top;
     reset = 1;
 
     gen = new();
-    gen.generate_machine_code(); // writes memfile.dat and dmemfile.dat
+    gen.generate_machine_code(); // writes memfile.dat
     gen.display_all();
 
-    // Call $readmemh on the files written with $writememh
+    // Call $readmemh on the file written with $writememh
     #1;                          // wait for imem's own initial block to finish
-    $readmemh("memfile.dat",  dut.imem.RAM);
-    $readmemh("dmemfile.dat", dut.dmem.RAM);
+    $readmemh("memfile.dat", dut.imem.RAM);
 
     // Deassert reset
     @(negedge clk);
@@ -463,17 +489,16 @@ module tb_top;
   end
 
   // --------------------------------------------------------------------------
-  // Trickbox: when 0xDEADBEEF is written to 0xFC, check the final state and
-  // set vif.done (the test then drops its objection -> end of simulation)
+  // Trickbox: when a valid instruction with destination $0 reaches writeback
+  // (lw $0, 0($0)), check the final state and set vif.done (the test then
+  // drops its objection -> end of simulation). NOPs and flushed/bubbled
+  // instructions have WB_valid = 0, so they never trigger it.
   // --------------------------------------------------------------------------
   always @(negedge clk) begin
-    if (!reset && dut.dmem.we === 1 &&
-        dut.dmem.a  === TRICKBOX_ADDR &&
-        dut.dmem.wd === TRICKBOX_DATA) begin
-      $display("\n[TRICKBOX] Address %h was written to, with data %h. Simulation ending.",
-               dut.dmem.a, dut.dmem.wd);
-      @(posedge clk);            // let the instruction before the SW write back
-      #1;
+    if (!reset && !vif.done && dut.mips.dp.WB_valid === 1 &&
+        dut.mips.dp.WB_regwrite === 1 && dut.mips.dp.WB_dest === 5'd0) begin
+      $display("\n[TRICKBOX] Instruction with destination $0 reached writeback. Simulation ending.");
+      // Every older instruction has already written back, so check now
       check_final_state();
       vif.done = 1;
     end
@@ -488,8 +513,9 @@ module tb_top;
                                       r, dut.mips.dp.rf.rf[r], gen.model_reg[r]))
         errors++;
       end
+    // Only words the program stores to: the rest of dmem is never initialized (X)
     for (int w = 0; w < DMEM_WORDS; w++)
-      if (dut.dmem.RAM[w] !== gen.model_mem[w]) begin
+      if (gen.model_mem_written[w] && dut.dmem.RAM[w] !== gen.model_mem[w]) begin
         `uvm_error("CHECK", $sformatf("mem[%h] = %h, expected %h",
                                       w * 4, dut.dmem.RAM[w], gen.model_mem[w]))
         errors++;
@@ -511,3 +537,4 @@ module tb_top;
   end
 
 endmodule
+

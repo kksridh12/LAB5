@@ -1,7 +1,7 @@
 VCS ?= $(VCS_HOME)/bin/vcs
 VERDI ?= $(VERDI_HOME)/bin/verdi
 SEED ?= 1
-SEEDS ?= 1 2 3 4 5 6 7 8 9 10 11 12
+SEEDS ?= 1 2 3 4 5 6 7 8 9 10 11 12 13 14
 UVM_VERBOSITY ?= UVM_MEDIUM
 
 # Part 3 depends on the Part 2 random instruction generator plus the Part 3

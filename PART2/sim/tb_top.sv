@@ -2,11 +2,11 @@
 // tb_top.sv  --  Lab 5 Part 2 testbench
 //
 //  1. Create the instruction generator and generate a random program
-//  2. Load the program (memfile.dat) into instruction memory ($readmemh) and
-//     the starting data (dmemfile.dat) into data memory ($readmemh)
+//  2. Load the program (memfile.dat) into instruction memory ($readmemh).
+//     Data memory is not loaded: the program writes its own literals
 //  3. Deassert reset -> the MIPS processor starts fetching
-//  4. Trickbox: when the processor writes 0xDEADBEEF to address 0xFC,
-//     print a message and call $finish
+//  4. Trickbox: when a valid instruction with $0 as its destination reaches
+//     writeback (lw $0, 0($0)), print a message and call $finish
 //////////////////////////////////////////////////////////////////////////////
 module tb_top;
   import uvm_pkg::*;
@@ -37,15 +37,12 @@ module tb_top;
     reset = 1;
 
     gen = new();
-    gen.generate_machine_code(); // writes memfile.dat and dmemfile.dat
+    gen.generate_machine_code(); // writes memfile.dat
     gen.display_all();
 
     #1;                          // wait for imem's own initial block to finish
     $readmemh("memfile.dat",  dut.imem.RAM);
     `uvm_info("TB", "Loaded memfile.dat into imem", UVM_LOW)
-
-    $readmemh("dmemfile.dat", dut.dmem.RAM);
-    `uvm_info("TB", "Loaded dmemfile.dat into dmem", UVM_LOW)
 
     @(negedge clk);
     reset = 0;
@@ -63,16 +60,15 @@ module tb_top;
   end
 
   // --------------------------------------------------------------------------
-  // Trickbox: watch the data memory write port (XMR into the DUT)
+  // Trickbox: watch the writeback stage (XMR into the DUT).  Any valid
+  // instruction writing back with destination $0 ends the test.  NOPs and
+  // flushed/bubbled instructions have WB_valid = 0, so they never trigger it.
   // --------------------------------------------------------------------------
   always @(negedge clk) begin
-    if (!reset && dut.dmem.we === 1 &&
-        dut.dmem.a  === TRICKBOX_ADDR &&
-        dut.dmem.wd === TRICKBOX_DATA) begin
-      $display("\n[TRICKBOX] Address %h was written to, with data %h. Simulation ending.",
-               dut.dmem.a, dut.dmem.wd);
-      @(posedge clk);            // let the instruction before the SW write back
-      #1;
+    if (!reset && dut.mips.dp.WB_valid === 1 && dut.mips.dp.WB_regwrite === 1 &&
+        dut.mips.dp.WB_dest === 5'd0) begin
+      $display("\n[TRICKBOX] Instruction with destination $0 reached writeback. Simulation ending.");
+      // Every older instruction has already written back, so check now
       check_final_state();
       $finish;
     end
@@ -87,8 +83,9 @@ module tb_top;
                                       r, dut.mips.dp.rf.rf[r], gen.model_reg[r]))
         errors++;
       end
+    // Only words the program stores to: the rest of dmem is never initialized (X)
     for (int w = 0; w < DMEM_WORDS; w++)
-      if (dut.dmem.RAM[w] !== gen.model_mem[w]) begin
+      if (gen.model_mem_written[w] && dut.dmem.RAM[w] !== gen.model_mem[w]) begin
         `uvm_error("CHECK", $sformatf("mem[%h] = %h, expected %h",
                                       w * 4, dut.dmem.RAM[w], gen.model_mem[w]))
         errors++;

@@ -3,8 +3,7 @@
 //
 //   instruction           : one MIPS instruction (extends uvm_transaction)
 //   instruction_generator : builds a program = setup + random body + trickbox,
-//                           converts it to machine code (memfile.dat) and
-//                           writes the initial data memory (dmemfile.dat)
+//                           and converts it to machine code (memfile.dat)
 //   testbench             : small stand-alone module that only runs the
 //                           generator (the real testbench is tb_top.sv)
 //
@@ -22,13 +21,22 @@
 //   gaps         : 1..4 instructions between a dependent pair
 //   BEQ offsets  : 1..4 (forward)
 //
-// We only have 5 instructions (no ADDI), so the registers are initialized by
-// LW from a data memory that the testbench pre-loads from dmemfile.dat.
+// Data memory is NOT pre-loaded from a file.  The program writes its own
+// literals with a fixed setup template.  The setup uses ADDI
+// (the DUT supports it) because ADD/AND/LW/SW/BEQ alone can never make a
+// nonzero value.  The random body still uses only the 5 lab instructions.
 //
-// Trickbox (end of simulation):
-//   0xF8 is pre-loaded with 0xDEADBEEF.  The last two instructions are
-//       lw $1, 0xf8($0)
-//       sw $1, 0xfc($0)     <- testbench sees this write and ends the test
+// Setup (start of program), for i = 1..4:
+//       addi $i, $0, <init_val>
+//       sw   $i, <0x10/0x14/0x18/0x1C>($0)   -> registers AND memory initialized
+//
+// Trickbox (end of simulation): one instruction
+//       lw $0, 0($0)          <- destination register is $0
+// The testbench ends the test as soon as any valid instruction writes back
+// with $0 as its destination.  The body never targets $0 (dest regs are
+// $1..$4), NOPs/flushed instructions are not valid in the pipeline, so only
+// this instruction can trigger it.  The write to $0 is discarded by the
+// register file, and the load reads dmem word 0 (no side effects).
 //
 // Add -ntb_opts uvm to the VCS command line
 //////////////////////////////////////////////////////////////////////////////
@@ -42,14 +50,13 @@ package mips_instr_pkg;
   parameter int        IMEM_WORDS    = 64;            // size of imem in top.sv
   parameter int        DMEM_WORDS    = 64;            // size of dmem in top.sv
   parameter bit [15:0] MEM_ADDRS [4] = '{16'h10, 16'h14, 16'h18, 16'h1C};
-  parameter bit [15:0] MARKER_ADDR   = 16'hF8;        // holds TRICKBOX_DATA
-  parameter bit [15:0] TRICKBOX_ADDR = 16'hFC;        // trickbox location
-  parameter bit [31:0] TRICKBOX_DATA = 32'hDEADBEEF;
   parameter int        MIN_GAP       = 1;
   parameter int        MAX_GAP       = 4;
-  parameter int        MAX_BODY      = 45;            // max random instructions (fits in 64-word imem)
+  // max random instructions: 8 setup + body (+ up to 17 overshoot) + 1 trickbox <= 64
+  parameter int        MAX_BODY      = 45;
 
-  typedef enum {I_ADD, I_AND, I_LW, I_SW, I_BEQ} instr_kind_e;
+  // I_ADDI is only used by the fixed setup template, never randomized
+  typedef enum {I_ADD, I_AND, I_LW, I_SW, I_BEQ, I_ADDI} instr_kind_e;
 
 
   // ==========================================================================
@@ -63,6 +70,7 @@ package mips_instr_pkg;
     rand bit [15:0]   mem_addr;
     rand bit [2:0]    br_offset;  // BEQ: how many instructions to jump over
     rand bit          br_taken;   // BEQ: do we want this branch to be taken?
+    bit [15:0]        imm;        // ADDI immediate (templates only)
 
     // ---- Extra information filled in by the generator ----
     bit [4:0]  locked_reg;  // BEQ that is the 2nd instr of a pair must keep reading this reg
@@ -114,7 +122,7 @@ package mips_instr_pkg;
     // ---- Which register does this instruction write? (0 = none) ----
     function bit [4:0] dest_reg();
       if (opcode == I_ADD || opcode == I_AND) return reg_c;
-      if (opcode == I_LW)                     return reg_b;
+      if (opcode == I_LW || opcode == I_ADDI) return reg_b;
       return 0;
     endfunction
 
@@ -126,6 +134,7 @@ package mips_instr_pkg;
         I_LW:  return {6'b100011, reg_a, reg_b, mem_addr};
         I_SW:  return {6'b101011, reg_a, reg_b, mem_addr};
         I_BEQ: return {6'b000100, reg_a, reg_b, 13'b0, br_offset};
+        I_ADDI: return {6'b001000, reg_a, reg_b, imm};
       endcase
       return 0;
     endfunction
@@ -138,6 +147,7 @@ package mips_instr_pkg;
         I_LW:  return $sformatf("lw  $%0d, 0x%0h($%0d)", reg_b, mem_addr, reg_a);
         I_SW:  return $sformatf("sw  $%0d, 0x%0h($%0d)", reg_b, mem_addr, reg_a);
         I_BEQ: return $sformatf("beq $%0d, $%0d, %0d",   reg_a, reg_b, br_offset);
+        I_ADDI: return $sformatf("addi $%0d, $%0d, 0x%0h", reg_b, reg_a, imm);
       endcase
       return "???";
     endfunction
@@ -173,6 +183,7 @@ package mips_instr_pkg;
     // At the end it holds the expected final registers and memory.
     bit [31:0] model_reg [32];
     bit [31:0] model_mem [DMEM_WORDS];
+    bit        model_mem_written [DMEM_WORDS];  // 1 = the program stores to this word
 
     // Add one instruction to the end of the dynamic array
     function void add_instr(instruction t);
@@ -188,6 +199,19 @@ package mips_instr_pkg;
       t.reg_b    = reg_b;
       t.reg_c    = 0;
       t.mem_addr = addr;
+      t.note     = note;
+      return t;
+    endfunction
+
+    // Make a fixed ADDI: rt = rs + sign_extend(imm)
+    function instruction make_addi(bit [4:0] rt, bit [4:0] rs, bit [15:0] imm, string note);
+      instruction t = new("template");
+      t.opcode   = I_ADDI;
+      t.reg_a    = rs;
+      t.reg_b    = rt;
+      t.reg_c    = 0;
+      t.mem_addr = 0;
+      t.imm      = imm;
       t.note     = note;
       return t;
     endfunction
@@ -218,7 +242,7 @@ package mips_instr_pkg;
       instruction txn1     = new("pair_first");
       instruction txn2     = new("pair_second");
       int         gap      = $urandom_range(MIN_GAP, MAX_GAP);
-      bit         mem_dep  = ($urandom_range(0, 9) < 3);    // 30% memory, 70% register
+      bit         mem_dep  = ($urandom_range(0, 9) < 5);    // 50% memory, 50% register
       bit [4:0]   dep_reg  = 0;
       bit [15:0]  dep_addr = 0;
 
@@ -291,9 +315,11 @@ package mips_instr_pkg;
       instr_list = new[0];
       n_pairs    = 0;
 
-      // Setup template: load $1..$4 from the 4 data words
-      for (int i = 0; i < 4; i++)
-        add_instr(make_lw_sw(I_LW, i + 1, MEM_ADDRS[i], "setup"));
+      // Setup template: write the 4 literals into $1..$4 and into data memory
+      for (int i = 0; i < 4; i++) begin
+        add_instr(make_addi(i + 1, 0, init_val[i][15:0], "setup: literal"));
+        add_instr(make_lw_sw(I_SW, i + 1, MEM_ADDRS[i], "setup: write literal to mem"));
+      end
 
       // Random body: mix of single instructions and dependent pairs
       while (body_count < num_body) begin
@@ -326,15 +352,19 @@ package mips_instr_pkg;
       if (instr_list[instr_list.size() - 1].opcode == I_BEQ)
         generate_individual(0);
 
-      // Trickbox template: write 0xDEADBEEF to 0xFC -> end of simulation
+      // Trickbox template: lw $0, 0($0) -> end of simulation
       teardown_idx = instr_list.size();
-      add_instr(make_lw_sw(I_LW, 1, MARKER_ADDR,   "trickbox: load 0xDEADBEEF"));
-      add_instr(make_lw_sw(I_SW, 1, TRICKBOX_ADDR, "trickbox: END OF TEST"));
+      add_trickbox();
 
       if (instr_list.size() > IMEM_WORDS)
         `uvm_fatal("GEN", "program is bigger than the instruction memory")
 
       fix_branches();
+    endfunction
+
+    // lw $0, 0($0): the only instruction in the program with $0 as destination
+    function void add_trickbox();
+      add_instr(make_lw_sw(I_LW, 0, 16'h0, "trickbox: dest $0 -> END OF TEST"));
     endfunction
 
     // ------------------------------------------------------------------------
@@ -348,11 +378,11 @@ package mips_instr_pkg;
       int skip_until = 0;    // instructions before this index are jumped over
       instruction t;
 
-      // Model starts like the real hardware after the TB loads dmemfile.dat
+      // Model starts with registers and data memory all zero.  The hardware
+      // dmem is not initialized (X), so only words the program stores to
+      // (model_mem_written) are compared at the end.  The setup writes the literals.
       foreach (model_reg[r]) model_reg[r] = 0;
-      foreach (model_mem[w]) model_mem[w] = 0;
-      for (int i = 0; i < 4; i++) model_mem[MEM_ADDRS[i] >> 2] = init_val[i];
-      model_mem[MARKER_ADDR >> 2] = TRICKBOX_DATA;
+      foreach (model_mem[w]) begin model_mem[w] = 0; model_mem_written[w] = 0; end
 
       for (int i = 0; i < instr_list.size(); i++) begin
         t = instr_list[i];
@@ -364,14 +394,25 @@ package mips_instr_pkg;
         case (t.opcode)
           I_ADD: model_reg[t.reg_c] = model_reg[t.reg_a] + model_reg[t.reg_b];
           I_AND: model_reg[t.reg_c] = model_reg[t.reg_a] & model_reg[t.reg_b];
-          I_LW:  model_reg[t.reg_b] = model_mem[t.mem_addr >> 2];
-          I_SW:  model_mem[t.mem_addr >> 2] = model_reg[t.reg_b];
+          I_LW:  model_reg[t.reg_b] = model_mem[mem_index(t)];
+          I_SW:  begin
+                   model_mem[mem_index(t)]         = model_reg[t.reg_b];
+                   model_mem_written[mem_index(t)] = 1;
+                 end
+          I_ADDI: model_reg[t.reg_b] = model_reg[t.reg_a] + {{16{t.imm[15]}}, t.imm};
           I_BEQ: begin
             pick_branch_regs(t);
             if (t.taken) skip_until = i + 1 + t.br_offset;
           end
         endcase
+        model_reg[0] = 0;                          // $0 is hardwired to zero
       end
+    endfunction
+
+    // dmem word used by LW/SW: base + sign-extended offset, bits [7:2] (like dmem)
+    function int mem_index(instruction t);
+      bit [31:0] ea = model_reg[t.reg_a] + {{16{t.mem_addr[15]}}, t.mem_addr};
+      return ea[7:2];
     endfunction
 
     // Target must be inside the program and must not land in the middle of a
@@ -391,33 +432,39 @@ package mips_instr_pkg;
       t.br_taken  = 0;
     endfunction
 
+    // Collect every register that gives the wanted outcome and pick one at
+    // random, so reg_b is spread evenly over $1..$4 (no bias to a high/low reg).
     function void pick_branch_regs(instruction t);
-      bit [4:0] a;
+      bit [4:0] a, b;
+      bit [4:0] cand[$];                           // registers that give the wanted outcome
+
       if (t.locked_reg != 0) a = t.locked_reg;   // must keep the pair's register
       else                   a = t.reg_a;
 
-      t.reg_a = a;
-      if (t.br_taken) begin
-        t.reg_b = a;                               // same register -> always equal
-        for (int r = 1; r <= 4; r++)               // prefer another reg with same value
-          if (r != a && model_reg[r] == model_reg[a]) t.reg_b = r;
+      for (int r = 1; r <= 4; r++)
+        if (t.br_taken ? (model_reg[r] == model_reg[a])     // taken: same value (includes a)
+                       : (model_reg[r] != model_reg[a]))    // not taken: different value
+          cand.push_back(r);
+
+      if (cand.size() == 0) begin                  // not taken impossible: all 4 regs equal
+        b       = a;
         t.taken = 1;
       end
       else begin
-        t.reg_b = a;
-        t.taken = 1;                               // in case all 4 regs are equal
-        for (int r = 1; r <= 4; r++)
-          if (model_reg[r] != model_reg[a]) begin
-            t.reg_b = r;
-            t.taken = 0;
-          end
+        b       = cand[$urandom_range(0, cand.size() - 1)];
+        t.taken = t.br_taken;
       end
+
+      // Put the two registers in random slots (the pair's register may be in
+      // either reg_a or reg_b; the BEQ still reads it)
+      if ($urandom_range(0, 1)) begin t.reg_a = a; t.reg_b = b; end
+      else                      begin t.reg_a = b; t.reg_b = a; end
     endfunction
 
     // ------------------------------------------------------------------------
     // 6) Main function called by the testbench:
     //    generate the program, then write memfile.dat (padded with NOPs to
-    //    64 words) and dmemfile.dat
+    //    64 words).  Data memory literals are written by the program itself.
     // ------------------------------------------------------------------------
     function void generate_machine_code();
       bit [31:0] imem_image [IMEM_WORDS];
@@ -433,18 +480,6 @@ package mips_instr_pkg;
       foreach (machine_code_list[i]) imem_image[i] = machine_code_list[i];
 
       $writememh("memfile.dat", imem_image);
-      generate_data_memory();
-    endfunction
-
-    // Initial data memory -> dmemfile.dat
-    function void generate_data_memory();
-      bit [31:0] dmem_image [DMEM_WORDS];
-
-      foreach (dmem_image[i]) dmem_image[i] = 0;
-      for (int i = 0; i < 4; i++) dmem_image[MEM_ADDRS[i] >> 2] = init_val[i];
-      dmem_image[MARKER_ADDR >> 2] = TRICKBOX_DATA;
-
-      $writememh("dmemfile.dat", dmem_image);
     endfunction
 
     // ------------------------------------------------------------------------
@@ -466,7 +501,7 @@ package mips_instr_pkg;
                  i, i * 4, machine_code_list[i], t.convert2string(), status, t.note);
       end
       $display(" %0d instructions, %0d dependent pairs", instr_list.size(), n_pairs);
-      $display(" Initial mem : [0x10]=%0h [0x14]=%0h [0x18]=%0h [0x1C]=%0h",
+      $display(" Setup writes: [0x10]=%0h [0x14]=%0h [0x18]=%0h [0x1C]=%0h",
                init_val[0], init_val[1], init_val[2], init_val[3]);
       $display(" Expected end: $1=%0h $2=%0h $3=%0h $4=%0h",
                model_reg[1], model_reg[2], model_reg[3], model_reg[4]);

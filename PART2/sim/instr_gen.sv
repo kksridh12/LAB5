@@ -42,7 +42,6 @@ package mips_instr_pkg;
     bit [15:0]        imm;        // ADDI immediate (for initial values only)
 
     // ---- Extra information filled in by the generator ----
-    bit [4:0]  locked_reg;  // BEQ that is the 2nd instr of a pair must keep reading this reg
     bit        in_pair;     // gap or 2nd instr of a pair (branches must not land here)
     bit        executed;    // 0 if a taken branch jumps over this instruction
     bit        taken;       // BEQ: final outcome
@@ -87,7 +86,11 @@ package mips_instr_pkg;
     constraint valid_branch {
       br_offset inside {[1:4]};
     }
-    // No constraint on br_taken; it is 50-50 by default
+    // BEQ: br_taken (50-50) picks the registers.  Same register -> always
+    // taken; different registers -> not taken (unless the values happen to be equal)
+    constraint branch_regs {
+      if (opcode == I_BEQ) (reg_a == reg_b) == br_taken;
+    }
     
     // ---- Which register does this instruction write? (0 = none) ----
     function bit [4:0] dest_reg();
@@ -143,8 +146,8 @@ package mips_instr_pkg;
       unique {init_val};               // all different, so "not taken" is possible
     }
 
-      // End program instruction template: lw $0, 0($0) -> end of simulation (last imem word)
-    int endsim_idx = instr_list.size();
+    // Index of the end program instruction (lw $0, 0($0)), set in generate_sequence()
+    int endsim_idx;
     int n_pairs;
 
     // Simple model of the processor, used to make branches taken / not taken.
@@ -152,31 +155,6 @@ package mips_instr_pkg;
     bit [31:0] model_reg [32];
     bit [31:0] model_mem [DMEM_WORDS];
     bit        model_mem_written [DMEM_WORDS];  // 1 = the program stores to this word
-
-    // Make a fixed (non-random) LW or SW for the setup / trickbox templates
-    function instruction make_lw_sw(instr_kind_e opcode, bit [4:0] reg_b, bit [15:0] addr, string note);
-      instruction t = new("template");
-      t.opcode   = opcode;
-      t.reg_a    = 0;
-      t.reg_b    = reg_b;
-      t.reg_c    = 0;
-      t.mem_addr = addr;
-      t.note     = note;
-      return t;
-    endfunction
-
-    // Make a fixed ADDI: rt = rs + sign_extend(imm)
-    function instruction make_addi(bit [4:0] rt, bit [4:0] rs, bit [15:0] imm, string note);
-      instruction t = new("template");
-      t.opcode   = I_ADDI;
-      t.reg_a    = rs;
-      t.reg_b    = rt;
-      t.reg_c    = 0;
-      t.mem_addr = 0;
-      t.imm      = imm;
-      t.note     = note;
-      return t;
-    endfunction
 
     // ------------------------------------------------------------------------
     // 1) One random instruction, added to the end of instr_list
@@ -202,8 +180,9 @@ package mips_instr_pkg;
     function void generate_pairs();
       instruction txn1     = new("pair_first");
       instruction txn2     = new("pair_second");
+      // Use urandom_range to keep randomization simple.
       int         gap      = $urandom_range(MIN_GAP, MAX_GAP);
-      bit         mem_dep  = ($urandom_range(0, 9) < 5);    // 50% memory, 50% register
+      bit         mem_dep  = ($urandom_range(0, 1) < 1);    // 50% memory, 50% register
       bit [4:0]   dep_reg  = 0;
       bit [15:0]  dep_addr = 0;
 
@@ -218,7 +197,6 @@ package mips_instr_pkg;
                  else                (reg_a == dep_reg || reg_b == dep_reg); })
           else `uvm_fatal("GEN", "randomize() of pair (second) failed")
 
-        if (txn2.opcode == I_BEQ) txn2.locked_reg = dep_reg;
         txn2.note = $sformatf("pair %0d: uses $%0d, gap %0d", n_pairs, dep_reg, gap);
       end
       else begin
@@ -253,16 +231,41 @@ package mips_instr_pkg;
         assert(t.randomize() with {
                  opcode != I_BEQ;
                  if (!mem_dep) {
-                   !((opcode == I_ADD || opcode == I_AND) && reg_c == dep_reg);
-                   !(opcode == I_LW && reg_b == dep_reg);
+                   !((opcode == I_ADD || opcode == I_AND) && reg_c == dep_reg); // Choose an ADD/AND inst that dont have dest register the same as dest register for the pair
+                   !(opcode == I_LW && reg_b == dep_reg); // Choose an LW inst that dont have base register the same as dest register for the pair
                  } else {
-                   !(opcode == I_SW && mem_addr == dep_addr);
+                   !(opcode == I_SW && mem_addr == dep_addr); // Choose an SW inst that dont have memory address the same as the pair
                  } })
           else `uvm_fatal("GEN", "randomize() of gap instruction failed")
         t.in_pair = 1;
         t.note    = $sformatf("pair %0d: gap", n_pairs);
         instr_list.push_back(t);
       end
+    endfunction
+
+    // Functions for initializing registers and memory locations
+    function instruction make_lw_sw(instr_kind_e opcode, bit [4:0] reg_b, bit [15:0] addr, string note);
+      instruction t = new("template");
+      t.opcode   = opcode;
+      t.reg_a    = 0;
+      t.reg_b    = reg_b;
+      t.reg_c    = 0;
+      t.mem_addr = addr;
+      t.note     = note;
+      return t;
+    endfunction
+
+    // Make a fixed ADDI: rt = rs + sign_extend(imm)
+    function instruction make_addi(bit [4:0] rt, bit [4:0] rs, bit [15:0] imm, string note);
+      instruction t = new("template");
+      t.opcode   = I_ADDI;
+      t.reg_a    = rs;
+      t.reg_b    = rt;
+      t.reg_c    = 0;
+      t.mem_addr = 0;
+      t.imm      = imm;
+      t.note     = note;
+      return t;
     endfunction
 
     // ------------------------------------------------------------------------
@@ -297,12 +300,9 @@ package mips_instr_pkg;
           generate_individual(room >= 2);
         room = IMEM_WORDS - 1 - instr_list.size();
 
-        // A BEQ jumps over br_offset instructions. Fill that space with single
-        // instructions so the target is always safe and the random offset is kept.
-        // The space may hold another BEQ (gives BEQ -> BEQ order); that BEQ then
-        // needs its own br_offset single instructions after it, so n_skip grows.
-        // Near the end the space is cut short; pick_branch_offset() then picks
-        // an offset that still lands inside the program.
+        // Handling BEQ: if the last instruction is a BEQ, we need to generate enough
+        // instructions to satisfy its branch offset. n_skip keeps track of how many
+        // more instructions we need to generate to fill the branch target space.
         n_skip = 0;
         if (instr_list[instr_list.size() - 1].opcode == I_BEQ)
           n_skip = instr_list[instr_list.size() - 1].br_offset;
@@ -316,6 +316,7 @@ package mips_instr_pkg;
         end
       end
 
+      endsim_idx = instr_list.size();    // = 63, the last imem word
       add_end_program_inst();
 
       if (instr_list.size() != IMEM_WORDS)
@@ -333,11 +334,11 @@ package mips_instr_pkg;
     endfunction
 
     // ------------------------------------------------------------------------
-    // 5) Fix branches so taken / not-taken really happens.
-    //    We "run" the program on a simple model of the processor. For each BEQ
-    //    that is executed we choose reg_a/reg_b using the current register values:
-    //      taken     -> two registers with the same value
-    //      not taken -> two registers with different values
+    // 5) Run the program on a simple model of the processor:
+    //      - give every BEQ a safe offset (pick_branch_offset)
+    //      - record whether each executed BEQ is really taken (pick_branch_regs)
+    //      - mark the instructions a taken BEQ jumps over as not executed
+    //    At the end the model holds the expected final registers and memory.
     // ------------------------------------------------------------------------
     function void fix_branches();
       int skip_until = 0;    // instructions before this index are jumped over
@@ -380,50 +381,24 @@ package mips_instr_pkg;
       return ea[7:2];
     endfunction
 
-    // Target must be inside the program and must not land in the middle of a
-    // pair (that would skip the pair's first instruction).
+    // Target = i + 1 + br_offset.  generate_sequence() puts br_offset single
+    // (non-pair) instructions after every BEQ, so the target is never inside a
+    // pair.  Only near the end of the program can that fill be cut short: then
+    // shorten the offset so the branch lands at most on the end-of-sim
+    // instruction.
     function void pick_branch_offset(int i, instruction t);
-      int off, target;
-      for (int k = 0; k < 4; k++) begin
-        off    = ((t.br_offset - 1 + k) % 4) + 1;     // try the random offset first
-        target = i + 1 + off;
-	if (target <= endsim_idx && !instr_list[target].in_pair) begin
-          t.br_offset = off;
-          return;
-        end
-      end
-      // No safe target: keep offset 1 and make the branch not taken
-      t.br_offset = 1;
-      t.br_taken  = 0;
+      if (i + 1 + t.br_offset > endsim_idx)
+        t.br_offset = endsim_idx - i - 1;
+
+      // Safety net in case generate_sequence() is changed later
+      assert(t.br_offset >= 1 && !instr_list[i + 1 + t.br_offset].in_pair)
+        else `uvm_fatal("GEN", $sformatf("BEQ at %0d: unsafe offset %0d", i, t.br_offset))
     endfunction
 
-    // Collect every register that gives the wanted outcome and pick one at
-    // random, so reg_b is spread evenly over $1..$4 (no bias to a high/low reg).
+    // The BEQ registers are already chosen by randomize() (constraint
+    // branch_regs); just record the real outcome from the model registers
     function void pick_branch_regs(instruction t);
-      bit [4:0] a, b;
-      bit [4:0] cand[$];                           // registers that give the wanted outcome
-
-      if (t.locked_reg != 0) a = t.locked_reg;   // must keep the pair's register
-      else                   a = t.reg_a;
-
-      for (int r = 1; r <= 4; r++)
-        if (t.br_taken ? (model_reg[r] == model_reg[a])     // taken: same value (includes a)
-                       : (model_reg[r] != model_reg[a]))    // not taken: different value
-          cand.push_back(r);
-
-      if (cand.size() == 0) begin                  // not taken impossible: all 4 regs equal
-        b       = a;
-        t.taken = 1;
-      end
-      else begin
-        b       = cand[$urandom_range(0, cand.size() - 1)];
-        t.taken = t.br_taken;
-      end
-
-      // Put the two registers in random slots (the pair's register may be in
-      // either reg_a or reg_b; the BEQ still reads it)
-      if ($urandom_range(0, 1)) begin t.reg_a = a; t.reg_b = b; end
-      else                      begin t.reg_a = b; t.reg_b = a; end
+      t.taken = (model_reg[t.reg_a] == model_reg[t.reg_b]);
     endfunction
 
     // ------------------------------------------------------------------------

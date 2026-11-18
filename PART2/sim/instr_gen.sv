@@ -131,7 +131,7 @@ package mips_instr_pkg;
   // instruction_generator : builds the whole program
   // ==========================================================================
   class instruction_generator;
-    instruction instr_list[];          // the program (dynamic array)
+    instruction instr_list[$];          // the program (dynamic array)
     bit [31:0]  machine_code_list[];   // the program as machine code
 
     rand int        pair_percent;      // chance (%) of making a dependent pair
@@ -143,7 +143,8 @@ package mips_instr_pkg;
       unique {init_val};               // all different, so "not taken" is possible
     }
 
-    int teardown_idx;                  // index of the first trickbox instruction
+      // End program instruction template: lw $0, 0($0) -> end of simulation (last imem word)
+    int endsim_idx = instr_list.size();
     int n_pairs;
 
     // Simple model of the processor, used to make branches taken / not taken.
@@ -154,8 +155,7 @@ package mips_instr_pkg;
 
     // Add one instruction to the end of the dynamic array
     function void add_instr(instruction t);
-      instr_list = new[instr_list.size() + 1](instr_list);
-      instr_list[instr_list.size() - 1] = t;
+      instr_list.push_back(t);
     endfunction
 
     // Make a fixed (non-random) LW or SW for the setup / trickbox templates
@@ -187,17 +187,16 @@ package mips_instr_pkg;
     // 1) One random instruction, added to the end of instr_list
     // ------------------------------------------------------------------------
     function void generate_individual(bit allow_branch = 1);
-      int i = instr_list.size();
-      instr_list    = new[i + 1](instr_list);
-      instr_list[i] = new("individual");
+      instruction t = new("individual");
       if (allow_branch) begin
-        assert(instr_list[i].randomize())
+        assert(t.randomize())
           else `uvm_fatal("GEN", "randomize() of individual instruction failed")
       end
       else begin
-        assert(instr_list[i].randomize() with { opcode != I_BEQ; })
+        assert(t.randomize() with { opcode != I_BEQ; })
           else `uvm_fatal("GEN", "randomize() of individual instruction failed")
       end
+      instr_list.push_back(t);
     endfunction
 
     // ------------------------------------------------------------------------
@@ -278,7 +277,6 @@ package mips_instr_pkg;
       int n_skip;
       int room;                          // free words left before the end_program_inst
 
-      instr_list = new[0];
       n_pairs    = 0;
 
       // Setup: write the 4 literals into $1..$4 and into data memory
@@ -323,8 +321,6 @@ package mips_instr_pkg;
         end
       end
 
-      // End program instruction template: lw $0, 0($0) -> end of simulation (last imem word)
-      teardown_idx = instr_list.size();
       add_end_program_inst();
 
       if (instr_list.size() != IMEM_WORDS)
@@ -396,7 +392,7 @@ package mips_instr_pkg;
       for (int k = 0; k < 4; k++) begin
         off    = ((t.br_offset - 1 + k) % 4) + 1;     // try the random offset first
         target = i + 1 + off;
-        if (target <= teardown_idx && !instr_list[target].in_pair) begin
+	if (target <= endsim_idx && !instr_list[target].in_pair) begin
           t.br_offset = off;
           return;
         end
@@ -634,4 +630,3 @@ module tb_top;
   end
 
 endmodule
-

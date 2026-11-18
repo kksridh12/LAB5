@@ -10,15 +10,16 @@
 //   instr_env      : monitor -> coverage collector
 //   my_test        : builds the env, keeps the simulation running until the
 //                    trickbox says the program is done
-//   tb_top         : DUT, interface, resource db, generator, memories, reset,
-//                    run_test(), trickbox, final-state check
+//   tb_top         : NOT here -- shared module in ../instr_gen.sv, compiled
+//                    with +define+COVERAGE (drives instr_mem_if, resource db,
+//                    run_test("my_test"), sets vif.done at the trickbox)
 //
 // Program = setup (addi $i / sw $i, writes the literals) + random body +
 // trickbox (lw $0, 0($0): the only instruction with $0 as destination).
 // ADDI only appears in the setup; it is decoded and tracked by the monitor
 // (so register dependencies stay correct) but has no coverage bins.
 //
-// The instruction class and the generator come from Part 2 (../instr_gen.sv).
+// The instruction class, the generator and tb_top come from Part 2 (../instr_gen.sv).
 // Add -ntb_opts uvm to the VCS command line
 //////////////////////////////////////////////////////////////////////////////
 import uvm_pkg::*;
@@ -55,8 +56,8 @@ class instr_monitor extends uvm_monitor;
   function void build_phase(uvm_phase phase);
     super.build_phase(phase);
     // Get vif from resource db
-    if (!uvm_config_db #(virtual instr_mem_if)::get(this, "", "vif", vif))
-      `uvm_fatal("MON", "Could not get vif from uvm_config_db")
+    if (!uvm_resource_db #(virtual instr_mem_if)::read_by_name(get_full_name(), "vif", vif, this))
+      `uvm_fatal("MON", "Could not get vif from uvm_resource_db")
   endfunction
 
   task run_phase(uvm_phase phase);
@@ -131,13 +132,12 @@ class instr_monitor extends uvm_monitor;
   // Send the oldest pending instruction to the analysis port
   function void send_oldest();
     instruction tr;
-    string      msg;
 
-    tr  = pending.pop_front();
-    msg = tr.convert2string();
-    if (tr.opcode == I_BEQ && tr.taken == 1) msg = {msg, "   (taken)"};
-    if (tr.opcode == I_BEQ && tr.taken == 0) msg = {msg, "   (not taken)"};
-    `uvm_info("MON", $sformatf("pc %h executed: %s", tr.pc, msg), UVM_MEDIUM)
+    tr = pending.pop_front();
+    if (tr.opcode == I_BEQ) tr.note = tr.taken ? "(taken)" : "(not taken)";
+    // Same verbosity control as the old `uvm_info(..., UVM_MEDIUM)
+    if (uvm_report_enabled(UVM_MEDIUM, UVM_INFO, "MON"))
+      tr.print_me($sformatf("[MON] pc %h executed: ", tr.pc));
 
     ap.write(tr);
   endfunction
@@ -416,8 +416,8 @@ class my_test extends uvm_test;
   function void build_phase(uvm_phase phase);
     super.build_phase(phase);
     env = instr_env::type_id::create("env", this);
-    if (!uvm_config_db #(virtual instr_mem_if)::get(this, "", "vif", vif))
-      `uvm_fatal("TEST", "Could not get vif from uvm_config_db")
+    if (!uvm_resource_db #(virtual instr_mem_if)::read_by_name(get_full_name(), "vif", vif, this))
+      `uvm_fatal("TEST", "Could not get vif from uvm_resource_db")
   endfunction
 
   function void end_of_elaboration_phase(uvm_phase phase);

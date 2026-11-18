@@ -39,7 +39,7 @@ package mips_instr_pkg;
     rand bit [15:0]   mem_addr;
     rand bit [2:0]    br_offset;  // BEQ: how many instructions to jump over
     rand bit          br_taken;   // BEQ: do we want this branch to be taken?
-    bit [15:0]        imm;        // ADDI immediate (templates only)
+    bit [15:0]        imm;        // ADDI immediate (for initial values only)
 
     // ---- Extra information filled in by the generator ----
     bit [4:0]  locked_reg;  // BEQ that is the 2nd instr of a pair must keep reading this reg
@@ -83,11 +83,12 @@ package mips_instr_pkg;
       else                                  mem_addr == 0;
     }
 
-    // Branch offset 1..4 (br_taken is 50-50 by default)
+    // Branch offset 1..4 
     constraint valid_branch {
       br_offset inside {[1:4]};
     }
-
+    // No constraint on br_taken; it is 50-50 by default
+    
     // ---- Which register does this instruction write? (0 = none) ----
     function bit [4:0] dest_reg();
       if (opcode == I_ADD || opcode == I_AND) return reg_c;
@@ -108,21 +109,20 @@ package mips_instr_pkg;
       return 0;
     endfunction
 
-    // ---- Assembly text, e.g. "add $3, $1, $2" ----
-    virtual function string convert2string();
+    // One line: [prefix] machine code, assembly text (e.g. "add $3, $1, $2"), note
+    // (prefix lets the caller add its own columns, e.g. index / pc / status)
+    function void print_me(string prefix = "");
+      string asm_txt;
       case (opcode)
-        I_ADD: return $sformatf("add $%0d, $%0d, $%0d", reg_c, reg_a, reg_b);
-        I_AND: return $sformatf("and $%0d, $%0d, $%0d", reg_c, reg_a, reg_b);
-        I_LW:  return $sformatf("lw  $%0d, 0x%0h($%0d)", reg_b, mem_addr, reg_a);
-        I_SW:  return $sformatf("sw  $%0d, 0x%0h($%0d)", reg_b, mem_addr, reg_a);
-        I_BEQ: return $sformatf("beq $%0d, $%0d, %0d",   reg_a, reg_b, br_offset);
-        I_ADDI: return $sformatf("addi $%0d, $%0d, 0x%0h", reg_b, reg_a, imm);
+        I_ADD:  asm_txt = $sformatf("add $%0d, $%0d, $%0d",   reg_c, reg_a, reg_b);
+        I_AND:  asm_txt = $sformatf("and $%0d, $%0d, $%0d",   reg_c, reg_a, reg_b);
+        I_LW:   asm_txt = $sformatf("lw  $%0d, 0x%0h($%0d)",  reg_b, mem_addr, reg_a);
+        I_SW:   asm_txt = $sformatf("sw  $%0d, 0x%0h($%0d)",  reg_b, mem_addr, reg_a);
+        I_BEQ:  asm_txt = $sformatf("beq $%0d, $%0d, %0d",    reg_a, reg_b, br_offset);
+        I_ADDI: asm_txt = $sformatf("addi $%0d, $%0d, 0x%0h", reg_b, reg_a, imm);
+        default: asm_txt = "???";
       endcase
-      return "???";
-    endfunction
-
-    function void print_me();
-      $display("%h  %-21s  %s", machine_code(), convert2string(), note);
+      $display("%s%h  %-21s  %s", prefix, machine_code(), asm_txt, note);
     endfunction
   endclass
 
@@ -465,15 +465,14 @@ package mips_instr_pkg;
       instruction t;
 
       $display("\n================= Generated MIPS program =================");
-      $display(" idx  pc    machine   assembly               status      note");
+      $display(" idx  pc    status      machine   assembly               note");
       foreach (instr_list[i]) begin
         t = instr_list[i];
         if (!t.executed)            status = "skipped";
         else if (t.opcode != I_BEQ) status = "";
         else if (t.taken)           status = "TAKEN";
         else                        status = "not-taken";
-        $display("%4d  %4h  %8h  %-21s  %-10s  %s",
-                 i, i * 4, machine_code_list[i], t.convert2string(), status, t.note);
+        t.print_me($sformatf("%4d  %4h  %-10s  ", i, i * 4, status));
       end
       $display(" %0d instructions, %0d dependent pairs", instr_list.size(), n_pairs);
       $display(" Setup writes: [0x10]=%0h [0x14]=%0h [0x18]=%0h [0x1C]=%0h",

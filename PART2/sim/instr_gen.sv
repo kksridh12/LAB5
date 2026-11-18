@@ -146,8 +146,6 @@ package mips_instr_pkg;
       unique {init_val};               // all different, so "not taken" is possible
     }
 
-    // Index of the end program instruction (lw $0, 0($0)), set in generate_sequence()
-    int endsim_idx;
     int n_pairs;
 
     // Simple model of the processor, used to make branches taken / not taken.
@@ -292,38 +290,34 @@ package mips_instr_pkg;
       //    needs 3 + MAX_GAP words of room (1 left over to jump over).
       //  - A BEQ needs at least 1 instruction after it, so it needs 2 words.
       //    The last body word is therefore never a BEQ.
-      room = IMEM_WORDS - 1 - instr_list.size();
+      //  - n_skip = single instructions still needed after the last BEQ, so it
+      //    always jumps over singles (its target is never inside a pair).
+      //    No pair is started while n_skip > 0.
+      room   = IMEM_WORDS - 1 - instr_list.size();
+      n_skip = 0;
       while (room > 0) begin
-        if (room >= 3 + MAX_GAP && $urandom_range(0, 99) < pair_percent)
+        if (n_skip == 0 && room >= 3 + MAX_GAP && $urandom_range(0, 99) < pair_percent)
           generate_pairs();
         else
           generate_individual(room >= 2);
         room = IMEM_WORDS - 1 - instr_list.size();
+        if (n_skip > 0) n_skip--;
 
-        // Handling BEQ: if the last instruction is a BEQ, we need to generate enough
-        // instructions to satisfy its branch offset. n_skip keeps track of how many
-        // more instructions we need to generate to fill the branch target space.
-        n_skip = 0;
-        if (instr_list[instr_list.size() - 1].opcode == I_BEQ)
-          n_skip = instr_list[instr_list.size() - 1].br_offset;
-        while (n_skip > 0 && room > 0) begin
-          generate_individual(room >= 2);
-          room = IMEM_WORDS - 1 - instr_list.size();
-          n_skip--;
-          if (instr_list[instr_list.size() - 1].opcode == I_BEQ &&
-              instr_list[instr_list.size() - 1].br_offset > n_skip)
-            n_skip = instr_list[instr_list.size() - 1].br_offset;
+        // BEQ Handling: shorten its offset to fit the room left (target = at most
+        // the end program instruction), then it needs br_offset singles after it
+        if (instr_list[$].opcode == I_BEQ) begin
+          if (instr_list[$].br_offset > room) instr_list[$].br_offset = room;
+          if (instr_list[$].br_offset > n_skip) n_skip = instr_list[$].br_offset;
         end
       end
 
-      endsim_idx = instr_list.size();    // = 63, the last imem word
       add_end_program_inst();
 
       if (instr_list.size() != IMEM_WORDS)
         `uvm_fatal("GEN", $sformatf("program is %0d words, expected %0d",
                                     instr_list.size(), IMEM_WORDS))
 
-      fix_branches();
+      run_model();
     endfunction
 
     // End program instruction: one instruction
@@ -334,13 +328,12 @@ package mips_instr_pkg;
     endfunction
 
     // ------------------------------------------------------------------------
-    // 5) Run the program on a simple model of the processor:
-    //      - give every BEQ a safe offset (pick_branch_offset)
-    //      - record whether each executed BEQ is really taken (pick_branch_regs)
+    // 5) Reference model: run the program on a simple model of the processor
+    //      - record whether each executed BEQ is really taken (record_branch_outcome)
     //      - mark the instructions a taken BEQ jumps over as not executed
     //    At the end the model holds the expected final registers and memory.
     // ------------------------------------------------------------------------
-    function void fix_branches();
+    function void run_model();
       int skip_until = 0;    // instructions before this index are jumped over
       instruction t;
 
@@ -352,7 +345,10 @@ package mips_instr_pkg;
 
       for (int i = 0; i < instr_list.size(); i++) begin
         t = instr_list[i];
-        if (t.opcode == I_BEQ) pick_branch_offset(i, t);
+        // Safety net in case generate_sequence() is changed later
+        if (t.opcode == I_BEQ)
+          assert(t.br_offset >= 1 && !instr_list[i + 1 + t.br_offset].in_pair)
+            else `uvm_fatal("GEN", $sformatf("BEQ at %0d: unsafe offset %0d", i, t.br_offset))
 
         t.executed = (i >= skip_until);
         if (!t.executed) continue;
@@ -367,7 +363,7 @@ package mips_instr_pkg;
                  end
           I_ADDI: model_reg[t.reg_b] = model_reg[t.reg_a] + {{16{t.imm[15]}}, t.imm};
           I_BEQ: begin
-            pick_branch_regs(t);
+            record_branch_outcome(t);
             if (t.taken) skip_until = i + 1 + t.br_offset;
           end
         endcase
@@ -381,23 +377,9 @@ package mips_instr_pkg;
       return ea[7:2];
     endfunction
 
-    // Target = i + 1 + br_offset.  generate_sequence() puts br_offset single
-    // (non-pair) instructions after every BEQ, so the target is never inside a
-    // pair.  Only near the end of the program can that fill be cut short: then
-    // shorten the offset so the branch lands at most on the end-of-sim
-    // instruction.
-    function void pick_branch_offset(int i, instruction t);
-      if (i + 1 + t.br_offset > endsim_idx)
-        t.br_offset = endsim_idx - i - 1;
-
-      // Safety net in case generate_sequence() is changed later
-      assert(t.br_offset >= 1 && !instr_list[i + 1 + t.br_offset].in_pair)
-        else `uvm_fatal("GEN", $sformatf("BEQ at %0d: unsafe offset %0d", i, t.br_offset))
-    endfunction
-
     // The BEQ registers are already chosen by randomize() (constraint
     // branch_regs); just record the real outcome from the model registers
-    function void pick_branch_regs(instruction t);
+    function void record_branch_outcome(instruction t);
       t.taken = (model_reg[t.reg_a] == model_reg[t.reg_b]);
     endfunction
 

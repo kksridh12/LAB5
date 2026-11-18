@@ -131,7 +131,7 @@ package mips_instr_pkg;
   // instruction_generator : builds the whole program
   // ==========================================================================
   class instruction_generator;
-    instruction instr_list[$];          // the program (dynamic array)
+    instruction instr_list[$];          // the program (queue)
     bit [31:0]  machine_code_list[];   // the program as machine code
 
     rand int        pair_percent;      // chance (%) of making a dependent pair
@@ -152,11 +152,6 @@ package mips_instr_pkg;
     bit [31:0] model_reg [32];
     bit [31:0] model_mem [DMEM_WORDS];
     bit        model_mem_written [DMEM_WORDS];  // 1 = the program stores to this word
-
-    // Add one instruction to the end of the dynamic array
-    function void add_instr(instruction t);
-      instr_list.push_back(t);
-    endfunction
 
     // Make a fixed (non-random) LW or SW for the setup / trickbox templates
     function instruction make_lw_sw(instr_kind_e opcode, bit [4:0] reg_b, bit [15:0] addr, string note);
@@ -240,9 +235,9 @@ package mips_instr_pkg;
       txn1.note    = $sformatf("pair %0d: first", n_pairs);
       txn2.in_pair = 1;
 
-      add_instr(txn1);
+      instr_list.push_back(txn1);
       insert_gaps(gap, mem_dep, dep_reg, dep_addr);
-      add_instr(txn2);
+      instr_list.push_back(txn2);
       n_pairs++;
     endfunction
 
@@ -266,7 +261,7 @@ package mips_instr_pkg;
           else `uvm_fatal("GEN", "randomize() of gap instruction failed")
         t.in_pair = 1;
         t.note    = $sformatf("pair %0d: gap", n_pairs);
-        add_instr(t);
+        instr_list.push_back(t);
       end
     endfunction
 
@@ -284,8 +279,8 @@ package mips_instr_pkg;
       //       addi $i, $0, <init_val>
       //       sw   $i, <0x10/0x14/0x18/0x1C>($0)   -> registers AND memory initialized
       for (int i = 0; i < 4; i++) begin
-        add_instr(make_addi(i + 1, 0, init_val[i][15:0], "setup: literal"));
-        add_instr(make_lw_sw(I_SW, i + 1, MEM_ADDRS[i], "setup: write literal to mem"));
+        instr_list.push_back(make_addi(i + 1, 0, init_val[i][15:0], "setup: literal"));
+        instr_list.push_back(make_lw_sw(I_SW, i + 1, MEM_ADDRS[i], "setup: write literal to mem"));
       end
 
       // Random body: fill every word up to the end_program_inst (word 63).
@@ -334,7 +329,7 @@ package mips_instr_pkg;
     //       lw $0, 0($0)          <- destination register is $0
     // The testbench ends the test as soon as any valid instruction writes back with $0 as its destination.
     function void add_end_program_inst();
-      add_instr(make_lw_sw(I_LW, 0, 16'h0, "End of program instruction: dest $0 -> END OF TEST"));
+      instr_list.push_back(make_lw_sw(I_LW, 0, 16'h0, "End of program instruction: dest $0 -> END OF TEST"));
     endfunction
 
     // ------------------------------------------------------------------------

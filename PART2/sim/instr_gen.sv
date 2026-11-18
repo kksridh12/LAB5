@@ -1,34 +1,12 @@
 //////////////////////////////////////////////////////////////////////////////
-// instr_gen.sv  --  Lab 5 Part 2: constrained-random MIPS instruction generator
+// instr_gen.sv  --  constrained-random MIPS instruction generator
 //
 //   instruction           : one MIPS instruction (extends uvm_transaction)
 //   instruction_generator : builds a program = setup + random body + trickbox,
 //                           and converts it to machine code (memfile.dat)
-//   testbench             : small stand-alone module that only runs the
-//                           generator (the real testbench is tb_top.sv)
-//
-// Instruction fields:
-//   opcode   : ADD, AND, LW, SW or BEQ
-//   reg_a    : ADD/AND: source 1 | LW/SW: base ($0) | BEQ: compare reg 1
-//   reg_b    : ADD/AND: source 2 | LW: dest | SW: data | BEQ: compare reg 2
-//   reg_c    : ADD/AND: destination
-//   mem_addr : LW/SW address
-//
-// Lab limits (every generated instruction follows them):
-//   instructions : ADD, AND, LW, SW, BEQ
-//   registers    : $1, $2, $3, $4      ($0 is only used as the LW/SW base)
-//   data memory  : 0x10, 0x14, 0x18, 0x1C
-//   gaps         : 1..4 instructions between a dependent pair
-//   BEQ offsets  : 1..4 (forward)
-//
-// Data memory is NOT pre-loaded from a file.  The program writes its own
-// literals with a fixed setup template.  The setup uses ADDI
-// (the DUT supports it) because ADD/AND/LW/SW/BEQ alone can never make a
-// nonzero value.  The random body still uses only the 5 lab instructions.
-//
-// Setup (start of program), for i = 1..4:
-//       addi $i, $0, <init_val>
-//       sw   $i, <0x10/0x14/0x18/0x1C>($0)   -> registers AND memory initialized
+//   tb_top                : testbench shared by Part 2 and Part 3 (DUT,
+//                           generator, reset, trickbox, final-state check);
+//                           Part 3 adds its UVM hooks with +define+COVERAGE
 //
 // Add -ntb_opts uvm to the VCS command line
 //////////////////////////////////////////////////////////////////////////////
@@ -45,8 +23,6 @@ package mips_instr_pkg;
   parameter bit [15:0] MEM_ADDRS [4] = '{16'h10, 16'h14, 16'h18, 16'h1C};
   parameter int        MIN_GAP       = 1;
   parameter int        MAX_GAP       = 4;
-  // max random instructions: 8 setup + body (+ up to 17 overshoot) + 1 trickbox <= 64
-  parameter int        MAX_BODY      = 45;
 
   // I_ADDI is only used by the fixed setup template, never randomized
   typedef enum {I_ADD, I_AND, I_LW, I_SW, I_BEQ, I_ADDI} instr_kind_e;
@@ -78,7 +54,7 @@ package mips_instr_pkg;
     endfunction
 
     // ---- Constraints ----
-    // Only registers $1..$4. LW/SW use $0 as base, so address = mem_addr.
+    // Only registers $1-$4. LW/SW use $0 as base, so address = mem_addr.
     // ADD/AND read two different registers.
     constraint unique_regs {
       reg_b inside {[1:4]};
@@ -158,11 +134,9 @@ package mips_instr_pkg;
     instruction instr_list[];          // the program (dynamic array)
     bit [31:0]  machine_code_list[];   // the program as machine code
 
-    rand int        num_body;          // how many random instructions
     rand int        pair_percent;      // chance (%) of making a dependent pair
     rand bit [31:0] init_val[4];       // starting values for the 4 data words
 
-    constraint c_num_body     { num_body inside {[20:MAX_BODY]}; }
     constraint c_pair_percent { pair_percent inside {[30:70]}; }
     constraint c_init_val {
       foreach (init_val[i]) init_val[i] inside {[1:255]};
@@ -298,73 +272,73 @@ package mips_instr_pkg;
     endfunction
 
     // ------------------------------------------------------------------------
-    // 4) Whole program: setup + random body + trickbox
+    // 4) Whole program: setup + random body + end_program_inst
     // ------------------------------------------------------------------------
     function void generate_sequence();
-      int body_count = 0;
-      int size_before;
       int n_skip;
+      int room;                          // free words left before the end_program_inst
 
       instr_list = new[0];
       n_pairs    = 0;
 
-      // Setup template: write the 4 literals into $1..$4 and into data memory
+      // Setup: write the 4 literals into $1..$4 and into data memory
+      // (start of program), for i = 1..4:
+      //       addi $i, $0, <init_val>
+      //       sw   $i, <0x10/0x14/0x18/0x1C>($0)   -> registers AND memory initialized
       for (int i = 0; i < 4; i++) begin
         add_instr(make_addi(i + 1, 0, init_val[i][15:0], "setup: literal"));
         add_instr(make_lw_sw(I_SW, i + 1, MEM_ADDRS[i], "setup: write literal to mem"));
       end
 
-      // Random body: mix of single instructions and dependent pairs
-      while (body_count < num_body) begin
-        size_before = instr_list.size();
-        if ($urandom_range(0, 99) < pair_percent)
+      // Random body: fill every word up to the end_program_inst (word 63).
+      // room = free words left before the trickbox (updated after every add).
+      //  - A pair is at most 2 + MAX_GAP words and may end with a BEQ, so it
+      //    needs 3 + MAX_GAP words of room (1 left over to jump over).
+      //  - A BEQ needs at least 1 instruction after it, so it needs 2 words.
+      //    The last body word is therefore never a BEQ.
+      room = IMEM_WORDS - 1 - instr_list.size();
+      while (room > 0) begin
+        if (room >= 3 + MAX_GAP && $urandom_range(0, 99) < pair_percent)
           generate_pairs();
         else
-          generate_individual();
+          generate_individual(room >= 2);
+        room = IMEM_WORDS - 1 - instr_list.size();
 
         // A BEQ jumps over br_offset instructions. Fill that space with single
         // instructions so the target is always safe and the random offset is kept.
         // The space may hold another BEQ (gives BEQ -> BEQ order); that BEQ then
         // needs its own br_offset single instructions after it, so n_skip grows.
-        // Near the size limit no more BEQs are added, so the program fits in imem.
+        // Near the end the space is cut short; pick_branch_offset() then picks
+        // an offset that still lands inside the program.
         n_skip = 0;
         if (instr_list[instr_list.size() - 1].opcode == I_BEQ)
           n_skip = instr_list[instr_list.size() - 1].br_offset;
-        while (n_skip > 0) begin
-          generate_individual(instr_list.size() < MAX_BODY);
+        while (n_skip > 0 && room > 0) begin
+          generate_individual(room >= 2);
+          room = IMEM_WORDS - 1 - instr_list.size();
           n_skip--;
           if (instr_list[instr_list.size() - 1].opcode == I_BEQ &&
               instr_list[instr_list.size() - 1].br_offset > n_skip)
             n_skip = instr_list[instr_list.size() - 1].br_offset;
         end
-
-        body_count += instr_list.size() - size_before;
       end
 
-      // A branch just before the trickbox would have nowhere legal to jump
-      if (instr_list[instr_list.size() - 1].opcode == I_BEQ)
-        generate_individual(0);
-
-      // Trickbox template: lw $0, 0($0) -> end of simulation
+      // End program instruction template: lw $0, 0($0) -> end of simulation (last imem word)
       teardown_idx = instr_list.size();
-      add_trickbox();
+      add_end_program_inst();
 
-      if (instr_list.size() > IMEM_WORDS)
-        `uvm_fatal("GEN", "program is bigger than the instruction memory")
+      if (instr_list.size() != IMEM_WORDS)
+        `uvm_fatal("GEN", $sformatf("program is %0d words, expected %0d",
+                                    instr_list.size(), IMEM_WORDS))
 
       fix_branches();
     endfunction
 
-    // Trickbox (end of simulation): one instruction
+    // End program instruction: one instruction
     //       lw $0, 0($0)          <- destination register is $0
-    // The testbench ends the test as soon as any valid instruction writes back
-    // with $0 as its destination.  The body never targets $0 (dest regs are
-    // $1..$4), NOPs/flushed instructions are not valid in the pipeline, so only
-    // this instruction can trigger it.  The write to $0 is discarded by the
-    // register file, and the load reads dmem word 0 (no side effects).
-    // lw $0, 0($0): the only instruction in the program with $0 as destination
-    function void add_trickbox();
-      add_instr(make_lw_sw(I_LW, 0, 16'h0, "trickbox: dest $0 -> END OF TEST"));
+    // The testbench ends the test as soon as any valid instruction writes back with $0 as its destination.
+    function void add_end_program_inst();
+      add_instr(make_lw_sw(I_LW, 0, 16'h0, "End of program instruction: dest $0 -> END OF TEST"));
     endfunction
 
     // ------------------------------------------------------------------------
@@ -463,8 +437,8 @@ package mips_instr_pkg;
 
     // ------------------------------------------------------------------------
     // 6) Main function called by the testbench:
-    //    generate the program, then write memfile.dat (padded with NOPs to
-    //    64 words).  Data memory literals are written by the program itself.
+    //    generate the program, then write memfile.dat (all
+    //    64 words are used).  Data memory literals are written by the program itself.
     // ------------------------------------------------------------------------
     function void generate_machine_code();
       bit [31:0] imem_image [IMEM_WORDS];
@@ -473,11 +447,12 @@ package mips_instr_pkg;
         else `uvm_fatal("GEN", "randomize() of instruction_generator failed")
       generate_sequence();
 
+      // imem_image is a bit array, so unused words already start as 0 (NOP)
       machine_code_list = new[instr_list.size()];
-      foreach (instr_list[i]) machine_code_list[i] = instr_list[i].machine_code();
-
-      foreach (imem_image[i]) imem_image[i] = 0;
-      foreach (machine_code_list[i]) imem_image[i] = machine_code_list[i];
+      foreach (instr_list[i]) begin
+        machine_code_list[i] = instr_list[i].machine_code();
+        imem_image[i]        = machine_code_list[i];
+      end
 
       $writememh("memfile.dat", imem_image);
     endfunction
@@ -511,7 +486,26 @@ package mips_instr_pkg;
 
 endpackage
 
-module tb_top();
+
+// ============================================================================
+// tb_top : shared by Part 2 and Part 3 (named tb_top because the DUT module is
+// already called "top")
+//  1. Create the instruction generator and generate a random program
+//  2. Load the program (memfile.dat) into instruction memory ($readmemh).
+//     Data memory is not loaded: the program writes its own literals
+//  3. Deassert reset -> the MIPS processor starts fetching
+//  4. Trickbox: when a valid instruction with $0 as its destination reaches
+//     writeback (lw $0, 0($0)), check the final state and end the test
+//
+// Part 2 (default)      : prints a fetch trace, ends with $finish
+// Part 3 (+define+COVERAGE, also compile part3/instr_mem_if.sv and
+//         part3/coverage_collector.sv):
+//                         drives the instr_mem_if interface for the monitor,
+//                         puts it in the resource db, calls run_test("my_test")
+//                         and ends by setting vif.done (the test then drops
+//                         its objection, so UVM writes the coverage report)
+// ============================================================================
+module tb_top;
   import uvm_pkg::*;
   `include "uvm_macros.svh"
   import mips_instr_pkg::*;
@@ -639,4 +633,6 @@ module tb_top();
     $fsdbDumpfile("novas.fsdb");
     $fsdbDumpvars(0, tb_top);
   end
+
 endmodule
+

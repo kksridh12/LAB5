@@ -411,11 +411,6 @@ class my_test extends uvm_test;
       `uvm_fatal("TEST", "Could not get vif from uvm_resource_db")
   endfunction
 
-  function void end_of_elaboration_phase(uvm_phase phase);
-    super.end_of_elaboration_phase(phase);
-    uvm_top.print_topology();
-  endfunction
-
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     wait (vif.done == 1);

@@ -491,6 +491,7 @@ module tb_top;
   initial begin
     // Scope "*" = visible to every component; read with read_by_name("vif")
     uvm_resource_db #(virtual instr_mem_if)::set("*", "vif", vif);
+    uvm_top.enable_print_topology = 1; // Use this to debug uvm build phase and make sure all verification components are built correctly.
     run_test("my_test");
   end
 `endif

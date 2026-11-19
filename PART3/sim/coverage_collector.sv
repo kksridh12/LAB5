@@ -1,5 +1,5 @@
 //////////////////////////////////////////////////////////////////////////////
-// coverage_collector.sv  --  Lab 5 Part 3: functional coverage
+// coverage_collector.sv  --  functional coverage
 //
 //   instr_monitor  : watches the instruction fetch interface and sends one
 //                    instruction transaction for every EXECUTED instruction
@@ -14,12 +14,6 @@
 //                    with +define+COVERAGE (drives instr_mem_if, resource db,
 //                    run_test("my_test"), sets vif.done at the trickbox)
 //
-// Program = setup (addi $i / sw $i, writes the literals) + random body +
-// trickbox (lw $0, 0($0): the only instruction with $0 as destination).
-// ADDI only appears in the setup; it is decoded and tracked by the monitor
-// (so register dependencies stay correct) but has no coverage bins.
-//
-// The instruction class, the generator and tb_top come from Part 2 (../instr_gen.sv).
 // Add -ntb_opts uvm to the VCS command line
 //////////////////////////////////////////////////////////////////////////////
 import uvm_pkg::*;
@@ -113,15 +107,15 @@ class instr_monitor extends uvm_monitor;
 
   // Mark the BEQ at beq_pc as taken and remove everything fetched after it
   function void branch_was_taken(bit [31:0] beq_pc);
-    for (int i = 0; i < pending.size(); i++) begin
-      if (pending[i].pc == beq_pc) begin
-        pending[i].taken = 1;
-        while (pending.size() > i + 1)
-          pending.pop_back();
-        return;
-      end
-    end
-    `uvm_warning("MON", $sformatf("Taken branch at pc %h was not found", beq_pc))
+    // The BEQ is near the newest end: drop wrong-path instructions until it is last
+    // Flush out instructions fetched after the taken BEQ
+    while (pending.size() > 0 && pending[$].pc != beq_pc)
+      void'(pending.pop_back());
+
+    if (pending.size() == 0)
+      `uvm_warning("MON", $sformatf("Taken branch at pc %h was not found", beq_pc))
+    else
+      pending[$].taken = 1;
   endfunction
 
   // End-of-test instruction: lw $0, 0($0) (destination $0)
@@ -334,8 +328,6 @@ class instr_coverage extends uvm_subscriber #(instruction);
   endfunction
 
   // Find the most recent instruction that wrote register r.
-  // ADDI writers are found too (so an older writer is never matched by
-  // mistake), but cp_first has no ADDI bin, so they are not counted.
   function void check_reg_dependency(bit [4:0] r);
     for (int i = history.size() - 1; i >= 0; i--) begin
       if (history[i].dest_reg() == r) begin
@@ -398,9 +390,8 @@ endclass
 
 // ============================================================================
 // Test
-// Stimulus is not sent through UVM in this lab (the program is already in
-// instruction memory). The test only holds an objection until the trickbox
-// is hit; when it is dropped, UVM ends the simulation.
+// The test only holds an objection until the end of simulation is hit; 
+// when it is dropped, UVM ends the simulation.
 // ============================================================================
 class my_test extends uvm_test;
 
@@ -432,3 +423,4 @@ class my_test extends uvm_test;
     phase.drop_objection(this);
   endtask
 endclass
+

@@ -86,8 +86,9 @@ package mips_instr_pkg;
     constraint valid_branch {
       br_offset inside {[1:4]};
     }
-    // BEQ: br_taken (50-50) picks the registers.  Same register -> always
-    // taken; different registers -> not taken (unless the values happen to be equal)
+    // BEQ: br_taken (50-50) picks the registers.  
+    // Same register -> always taken; 
+    // Different registers -> not taken (unless the values happen to be equal)
     constraint branch_regs {
       if (opcode == I_BEQ) (reg_a == reg_b) == br_taken;
     }

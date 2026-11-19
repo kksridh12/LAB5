@@ -1,0 +1,22 @@
+
+PART2:
+
+cd PART2/sim
+
+make compile_verdi
+make sim
+make waves
+
+
+PART3:
+
+cd PART3/sim
+
+# Run all 10 seeds together 
+make regress ; 
+
+# Merge coverage from the runs
+make merge
+
+# Coverage viewer
+make cov

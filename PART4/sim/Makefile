@@ -40,7 +40,7 @@ compile_verdi:
 
 # Run the compiled simulation
 sim:
-	./simv +UVM_VERBOSITY=$(UVM_VERBOSITY) +ntb_random_seed=$(SEED) -cm line+tgl+cond+fsm -cm_dir cov_$(SEED).vdb -l sim_$(SEED).log
+	./simv +UVM_VERBOSITY=$(UVM_VERBOSITY) +ntb_random_seed=$(SEED) -cm line+tgl+cond+fsm -cm_dir simv.vdb -cm_name seed_$(SEED) -l sim_$(SEED).log
 
 # Launch Verdi, optionally loading the generated waveform database
 verdi:

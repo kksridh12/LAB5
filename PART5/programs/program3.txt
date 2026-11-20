@@ -1,0 +1,20 @@
+.text
+addi $at, $zero, 9
+addi $v0, $zero, 7
+add $v1, $at, $v0
+and $a0, $at, $v0
+sw $v1, 28($zero)
+lw $at, 28($zero)
+add $v0, $at, $a0
+beq $at, $v0, skip_first
+sw $v0, 24($zero)
+skip_first:
+beq $a0, $a0, after_skip
+addi $v1, $zero, 77
+after_skip:
+lw $v1, 24($zero)
+and $at, $v1, $v0
+sw $at, 20($zero)
+add $a0, $at, $v1
+sw $a0, 16($zero)
+lw $zero, 0($zero)

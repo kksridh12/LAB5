@@ -11,3 +11,4 @@
 *vc_hdrs*
 *.dat
 *.vdb
+!PART5/programs/*.dat

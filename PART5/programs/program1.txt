@@ -1,0 +1,20 @@
+.text
+addi $at, $zero, 5
+addi $v0, $zero, 3
+add $v1, $at, $v0
+and $a0, $v1, $at
+sw $v1, 16($zero)
+lw $v0, 16($zero)
+add $at, $v0, $a0
+beq $at, $zero, not_taken_target
+sw $at, 20($zero)
+not_taken_target:
+beq $at, $at, taken_target
+addi $a0, $zero, 99
+taken_target:
+lw $v1, 20($zero)
+and $v0, $v1, $at
+sw $v0, 24($zero)
+add $a0, $v0, $v1
+sw $a0, 28($zero)
+lw $zero, 0($zero)

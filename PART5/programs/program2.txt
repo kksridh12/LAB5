@@ -1,0 +1,20 @@
+.text
+addi $at, $zero, 12
+addi $v0, $zero, 7
+and $v1, $at, $v0
+add $a0, $at, $v0
+sw $a0, 16($zero)
+lw $at, 16($zero)
+add $v0, $at, $v1
+beq $v0, $zero, skip_store
+sw $v0, 20($zero)
+skip_store:
+beq $v1, $v1, after_skip
+addi $a0, $zero, 99
+after_skip:
+lw $a0, 20($zero)
+and $v1, $a0, $at
+sw $v1, 24($zero)
+add $v0, $v1, $a0
+sw $v0, 28($zero)
+lw $zero, 0($zero)

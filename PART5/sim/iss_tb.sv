@@ -27,10 +27,6 @@ module iss_tb;
             trace_file = "rtl_trace.txt";
         void'($value$plusargs("MAX_CYCLES=%d", max_cycles));
 
-        // Use known initial data-memory contents for both RTL and ISS.
-        for (int i = 0; i < 64; i++)
-            dut.dmem.RAM[i] = 32'b0;
-
         // Override the imem module's default memfile.dat initialization.
         #1;
         for (int i = 0; i < 64; i++)
